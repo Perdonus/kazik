@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>KAZINO • Кейсы CS:GO</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600&family=Russo+One&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <div class="backdrop"></div>
+
+  <div data-include="/partials/header.html"></div>
+  <div data-include="/partials/feed.html"></div>
+
+  <main class="content" id="mainContent">
+    <div data-include="/partials/pages/cases.html"></div>
+    <div data-include="/partials/pages/upgrade.html"></div>
+    <div data-include="/partials/pages/giveaways.html"></div>
+    <div data-include="/partials/pages/top.html"></div>
+    <div data-include="/partials/pages/account.html"></div>
+  </main>
+
+  <div data-include="/partials/modals/case.html"></div>
+  <div data-include="/partials/modals/balance.html"></div>
+  <div data-include="/partials/modals/auth.html"></div>
+  <div data-include="/partials/modals/notifications.html"></div>
+</body>
+</html>
