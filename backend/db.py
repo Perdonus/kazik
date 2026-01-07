@@ -1,92 +1,74 @@
 from __future__ import annotations
 
-import sqlite3
-from pathlib import Path
 import os
-from typing import Any, Iterable, Optional
+from pathlib import Path
+from typing import Optional
+
+from pymongo import MongoClient
 
 BASE_DIR = Path(__file__).resolve().parents[1]
-DEFAULT_DB_PATH = BASE_DIR / "data" / "kazino.db"
-DB_PATH = Path(os.environ.get("KAZINO_DB_PATH", DEFAULT_DB_PATH))
 
-if os.environ.get("VERCEL") and "KAZINO_DB_PATH" not in os.environ:
-    DB_PATH = Path("/tmp/kazino.db")
+# Env vars:
+# - MONGODB_URI (required)
+# - MONGODB_DB (optional, default: kazino)
+_MONGODB_URI = os.environ.get("MONGODB_URI") or os.environ.get("KAZINO_MONGODB_URI")
+_MONGODB_DB = os.environ.get("MONGODB_DB") or os.environ.get("KAZINO_MONGODB_DB") or "kazino"
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  nickname TEXT UNIQUE NOT NULL,
-  token TEXT UNIQUE,
-  balance INTEGER NOT NULL DEFAULT 0,
-  last_claim INTEGER NOT NULL DEFAULT 0,
-  cases_opened INTEGER NOT NULL DEFAULT 0,
-  cases_won INTEGER NOT NULL DEFAULT 0,
-  upgrades INTEGER NOT NULL DEFAULT 0,
-  upgrade_wins INTEGER NOT NULL DEFAULT 0,
-  max_balance INTEGER NOT NULL DEFAULT 0,
-  best_drop_item_id TEXT,
-  best_upgrade_item_id TEXT,
-  daily_cases INTEGER NOT NULL DEFAULT 0,
-  daily_reset INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS items (
-  id TEXT PRIMARY KEY,
-  user_id INTEGER NOT NULL,
-  name TEXT NOT NULL,
-  rarity TEXT NOT NULL,
-  price INTEGER NOT NULL,
-  stattrak INTEGER NOT NULL DEFAULT 0,
-  status TEXT NOT NULL,
-  source TEXT NOT NULL,
-  case_id TEXT,
-  created_at INTEGER NOT NULL,
-  FOREIGN KEY(user_id) REFERENCES users(id)
-);
-
-CREATE TABLE IF NOT EXISTS giveaway_entries (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL,
-  giveaway_id TEXT NOT NULL,
-  entry INTEGER NOT NULL,
-  joined_at INTEGER NOT NULL,
-  UNIQUE(user_id, giveaway_id)
-);
-"""
+_client: Optional[MongoClient] = None
 
 
-def connect() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+def get_client() -> MongoClient:
+    """Return a cached MongoClient.
+
+    In serverless (Vercel) this dramatically reduces connection churn on warm invocations.
+    """
+
+    global _client
+    if _client is None:
+        if not _MONGODB_URI:
+            raise RuntimeError(
+                "MONGODB_URI is not set. Add it in your environment variables (Vercel Project Settings)."
+            )
+        _client = MongoClient(
+            _MONGODB_URI,
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=5000,
+            socketTimeoutMS=10000,
+        )
+    return _client
+
+
+def get_db():
+    return get_client()[_MONGODB_DB]
+
+
+def users_col():
+    return get_db()["users"]
+
+
+def items_col():
+    return get_db()["items"]
+
+
+def giveaway_entries_col():
+    return get_db()["giveaway_entries"]
 
 
 def init_db() -> None:
-    with connect() as conn:
-        conn.executescript(SCHEMA)
+    """Create indexes (idempotent)."""
 
+    users = users_col()
+    items = items_col()
+    entries = giveaway_entries_col()
 
-def fetchone(query: str, params: Iterable[Any] = ()) -> Optional[sqlite3.Row]:
-    with connect() as conn:
-        cur = conn.execute(query, params)
-        return cur.fetchone()
+    # Users
+    users.create_index("nickname", unique=True)
+    users.create_index("token", unique=True, sparse=True)
 
+    # Items
+    items.create_index("user_id")
+    items.create_index([("user_id", 1), ("status", 1), ("created_at", -1)])
 
-def fetchall(query: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
-    with connect() as conn:
-        cur = conn.execute(query, params)
-        return cur.fetchall()
-
-
-def execute(query: str, params: Iterable[Any] = ()) -> None:
-    with connect() as conn:
-        conn.execute(query, params)
-        conn.commit()
-
-
-def execute_returning_id(query: str, params: Iterable[Any] = ()) -> int:
-    with connect() as conn:
-        cur = conn.execute(query, params)
-        conn.commit()
-        return cur.lastrowid
+    # Giveaways
+    entries.create_index([("user_id", 1), ("giveaway_id", 1)], unique=True)
+    entries.create_index([("user_id", 1), ("joined_at", -1)])

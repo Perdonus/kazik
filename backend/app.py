@@ -13,6 +13,8 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
 from . import db
 from .config import Config, RARITIES, get_config
@@ -53,8 +55,21 @@ class GiveawayJoinRequest(BaseModel):
     giveaway_id: str
 
 
+def users():
+    return db.users_col()
+
+
+def items():
+    return db.items_col()
+
+
+def giveaway_entries():
+    return db.giveaway_entries_col()
+
+
 @app.on_event("startup")
 def on_startup() -> None:
+    # Creates indexes (idempotent). In serverless this runs on each cold start.
     db.init_db()
     start_feed_thread()
 
@@ -76,22 +91,35 @@ def login(payload: LoginRequest) -> dict:
         raise HTTPException(status_code=400, detail="Ник обязателен")
 
     token = secrets.token_urlsafe(24)
-    with db.connect() as conn:
-        user = conn.execute("SELECT * FROM users WHERE nickname = ?", (nickname,)).fetchone()
-        if user is None:
-            user_id = conn.execute(
-                "INSERT INTO users (nickname, token, balance, max_balance, daily_reset) VALUES (?, ?, ?, ?, ?)",
-                (nickname, token, 500, 500, today_key()),
-            ).lastrowid
-            conn.commit()
-            user = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-        else:
-            conn.execute("UPDATE users SET token = ? WHERE id = ?", (token, user["id"]))
-            conn.commit()
-            user = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
 
-        user = reset_daily(conn, user)
-        return {"token": token, "user": user_payload(conn, user)}
+    user = users().find_one({"nickname": nickname})
+    if user is None:
+        now = int(time.time())
+        user_doc = {
+            "nickname": nickname,
+            "token": token,
+            "balance": 500,
+            "last_claim": 0,
+            "cases_opened": 0,
+            "cases_won": 0,
+            "upgrades": 0,
+            "upgrade_wins": 0,
+            "max_balance": 500,
+            "best_drop_item_id": None,
+            "best_upgrade_item_id": None,
+            "daily_cases": 0,
+            "daily_reset": today_key(),
+            "created_at": now,
+            "updated_at": now,
+        }
+        res = users().insert_one(user_doc)
+        user = users().find_one({"_id": res.inserted_id})
+    else:
+        users().update_one({"_id": user["_id"]}, {"$set": {"token": token, "updated_at": int(time.time())}})
+        user = users().find_one({"_id": user["_id"]})
+
+    user = reset_daily(user)
+    return {"token": token, "user": user_payload(user)}
 
 
 @app.get("/api/me")
@@ -100,10 +128,9 @@ def me(authorization: Optional[str] = Header(default=None)) -> dict:
     if not token:
         raise HTTPException(status_code=401, detail="Нет токена")
 
-    with db.connect() as conn:
-        user = fetch_user(conn, token)
-        user = reset_daily(conn, user)
-        return {"user": user_payload(conn, user)}
+    user = fetch_user(token)
+    user = reset_daily(user)
+    return {"user": user_payload(user)}
 
 
 @app.post("/api/balance/claim")
@@ -114,25 +141,28 @@ def claim_bonus(authorization: Optional[str] = Header(default=None)) -> dict:
 
     now = int(time.time())
     cooldown = 20 * 60
-    with db.connect() as conn:
-        user = fetch_user(conn, token)
-        user = reset_daily(conn, user)
-        if now - user["last_claim"] < cooldown:
-            return {
-                "claimed": False,
-                "user": user_payload(conn, user),
-                "next_claim": user["last_claim"] + cooldown,
-            }
 
-        new_balance = user["balance"] + 100
-        conn.execute(
-            "UPDATE users SET balance = ?, last_claim = ? WHERE id = ?",
-            (new_balance, now, user["id"]),
-        )
-        update_max_balance(conn, user["id"])
-        conn.commit()
-        user = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
-        return {"claimed": True, "user": user_payload(conn, user), "next_claim": now + cooldown}
+    user = fetch_user(token)
+    user = reset_daily(user)
+    if now - int(user.get("last_claim", 0)) < cooldown:
+        return {
+            "claimed": False,
+            "user": user_payload(user),
+            "next_claim": int(user.get("last_claim", 0)) + cooldown,
+        }
+
+    # Atomic increment + max_balance update
+    user = users().find_one_and_update(
+        {"_id": user["_id"]},
+        [
+            {"$set": {"balance": {"$add": ["$balance", 100]}, "last_claim": now}},
+            {"$set": {"max_balance": {"$max": ["$balance", {"$ifNull": ["$max_balance", 0]}]}}},
+            {"$set": {"updated_at": now}},
+        ],
+        return_document=ReturnDocument.AFTER,
+    )
+
+    return {"claimed": True, "user": user_payload(user), "next_claim": now + cooldown}
 
 
 @app.get("/api/cases/{case_id}/weapons")
@@ -173,26 +203,29 @@ def open_case(payload: CaseOpenRequest, authorization: Optional[str] = Header(de
     if not weapons:
         raise HTTPException(status_code=400, detail="В кейсе нет оружий")
 
-    with db.connect() as conn:
-        user = fetch_user(conn, token)
-        user = reset_daily(conn, user)
-        if user["balance"] < case.price:
-            raise HTTPException(status_code=400, detail="Недостаточно средств")
+    user = fetch_user(token)
+    user = reset_daily(user)
 
-        drop = roll_case_drop(config, weapons)
-        item_id = create_item(conn, user["id"], drop, status="owned", source="case", case_id=case.id)
+    if int(user.get("balance", 0)) < int(case.price):
+        raise HTTPException(status_code=400, detail="Недостаточно средств")
 
-        cases_won_inc = 1 if drop["price"] >= case.price else 0
-        conn.execute(
-            "UPDATE users SET balance = ?, cases_opened = cases_opened + 1, cases_won = cases_won + ?, daily_cases = daily_cases + 1 WHERE id = ?",
-            (user["balance"] - case.price, cases_won_inc, user["id"]),
-        )
-        maybe_update_best(conn, user, item_id, is_upgrade=False)
-        conn.commit()
+    drop = roll_case_drop(config, weapons)
+    item_id = create_item(user["_id"], drop, status="owned", source="case", case_id=case.id)
 
-        user = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
-        push_feed(user["nickname"], drop)
-        return {"drop": drop, "case_price": case.price, "user": user_payload(conn, user)}
+    cases_won_inc = 1 if int(drop["price"]) >= int(case.price) else 0
+    users().update_one(
+        {"_id": user["_id"]},
+        {
+            "$inc": {"balance": -int(case.price), "cases_opened": 1, "cases_won": cases_won_inc, "daily_cases": 1},
+            "$set": {"updated_at": int(time.time())},
+        },
+    )
+
+    maybe_update_best(user, item_id, is_upgrade=False)
+
+    user = users().find_one({"_id": user["_id"]})
+    push_feed(user["nickname"], drop)
+    return {"drop": drop, "case_price": case.price, "user": user_payload(user)}
 
 
 @app.post("/api/item/sell")
@@ -201,24 +234,18 @@ def sell_item(payload: SellRequest, authorization: Optional[str] = Header(defaul
     if not token:
         raise HTTPException(status_code=401, detail="Нет токена")
 
-    with db.connect() as conn:
-        user = fetch_user(conn, token)
-        item = conn.execute(
-            "SELECT * FROM items WHERE id = ? AND user_id = ? AND status = 'owned'",
-            (payload.item_id, user["id"]),
-        ).fetchone()
-        if not item:
-            raise HTTPException(status_code=404, detail="Оружие не найдено")
+    user = fetch_user(token)
 
-        conn.execute("UPDATE items SET status = 'sold' WHERE id = ?", (payload.item_id,))
-        conn.execute(
-            "UPDATE users SET balance = balance + ? WHERE id = ?",
-            (item["price"], user["id"]),
-        )
-        update_max_balance(conn, user["id"])
-        conn.commit()
-        user = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
-        return {"user": user_payload(conn, user)}
+    item = items().find_one({"_id": payload.item_id, "user_id": user["_id"], "status": "owned"})
+    if not item:
+        raise HTTPException(status_code=404, detail="Оружие не найдено")
+
+    items().update_one({"_id": payload.item_id}, {"$set": {"status": "sold"}})
+    users().update_one({"_id": user["_id"]}, {"$inc": {"balance": int(item["price"])}, "$set": {"updated_at": int(time.time())}})
+    update_max_balance(user["_id"])
+
+    user = users().find_one({"_id": user["_id"]})
+    return {"user": user_payload(user)}
 
 
 @app.post("/api/upgrade/targets")
@@ -232,20 +259,19 @@ def upgrade_targets(payload: UpgradeTargetsRequest, authorization: Optional[str]
 
     config = get_config()
 
-    with db.connect() as conn:
-        user = fetch_user(conn, token)
-        items = fetch_items(conn, user["id"], payload.item_ids)
-        total = sum(item["price"] for item in items)
-        if not total:
-            return {"value": 0, "targets": [], "chance": payload.chance}
+    user = fetch_user(token)
+    selected_items = fetch_items(user["_id"], payload.item_ids)
+    total = sum(int(item["price"]) for item in selected_items)
+    if not total:
+        return {"value": 0, "targets": [], "chance": payload.chance}
 
-        target_value = total * (100 / payload.chance)
-        targets = pick_upgrade_targets(config, target_value, count=8)
-        return {
-            "value": total,
-            "chance": payload.chance,
-            "targets": [weapon_payload(target) for target in targets],
-        }
+    target_value = total * (100 / payload.chance)
+    targets = pick_upgrade_targets(config, target_value, count=8)
+    return {
+        "value": total,
+        "chance": payload.chance,
+        "targets": [weapon_payload(target) for target in targets],
+    }
 
 
 @app.post("/api/upgrade/start")
@@ -262,63 +288,54 @@ def upgrade_start(payload: UpgradeStartRequest, authorization: Optional[str] = H
     if not target:
         raise HTTPException(status_code=404, detail="Цель не найдена")
 
-    with db.connect() as conn:
-        user = fetch_user(conn, token)
-        items = fetch_items(conn, user["id"], payload.item_ids)
-        if not items:
-            raise HTTPException(status_code=400, detail="Нет выбранных оружий")
+    user = fetch_user(token)
 
-        success = random.random() < (payload.chance / 100)
-        total = sum(item["price"] for item in items)
+    selected_items = fetch_items(user["_id"], payload.item_ids)
+    if not selected_items:
+        raise HTTPException(status_code=400, detail="Нет выбранных оружий")
 
-        conn.execute(
-            "UPDATE users SET upgrades = upgrades + 1 WHERE id = ?",
-            (user["id"],),
+    success = random.random() < (payload.chance / 100)
+    total = sum(int(item["price"]) for item in selected_items)
+
+    users().update_one({"_id": user["_id"]}, {"$inc": {"upgrades": 1}, "$set": {"updated_at": int(time.time())}})
+
+    if success:
+        reward = roll_upgrade_reward(target)
+        reward_item_id = create_item(user["_id"], reward, status="owned", source="upgrade", case_id=None)
+
+        items().update_many(
+            {"_id": {"$in": [it["_id"] for it in selected_items]}, "user_id": user["_id"], "status": "owned"},
+            {"$set": {"status": "upgraded"}},
         )
+        users().update_one({"_id": user["_id"]}, {"$inc": {"upgrade_wins": 1}})
 
-        if success:
-            reward = roll_upgrade_reward(target)
-            create_item(conn, user["id"], reward, status="owned", source="upgrade", case_id=None)
-            conn.execute(
-                "UPDATE items SET status = 'upgraded' WHERE id IN ({seq})".format(
-                    seq=",".join("?" * len(items))
-                ),
-                [item["id"] for item in items],
-            )
-            conn.execute(
-                "UPDATE users SET upgrade_wins = upgrade_wins + 1 WHERE id = ?",
-                (user["id"],),
-            )
-            maybe_update_best(conn, user, reward["id"], is_upgrade=True)
-            push_feed(user["nickname"], reward)
-            result = {"success": True, "reward": reward, "consolation": 0}
-        else:
-            conn.execute(
-                "UPDATE items SET status = 'failed' WHERE id IN ({seq})".format(
-                    seq=",".join("?" * len(items))
-                ),
-                [item["id"] for item in items],
-            )
-            consolation = round(total * 0.05)
-            conn.execute(
-                "UPDATE users SET balance = balance + ? WHERE id = ?",
-                (consolation, user["id"]),
-            )
-            update_max_balance(conn, user["id"])
-            result = {"success": False, "reward": None, "consolation": consolation}
+        # refresh user for best comparison
+        user = users().find_one({"_id": user["_id"]})
+        maybe_update_best(user, reward_item_id, is_upgrade=True)
 
-        conn.commit()
-        user = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
-        result["user"] = user_payload(conn, user)
-        return result
+        push_feed(user["nickname"], reward)
+        result = {"success": True, "reward": reward, "consolation": 0}
+    else:
+        items().update_many(
+            {"_id": {"$in": [it["_id"] for it in selected_items]}, "user_id": user["_id"], "status": "owned"},
+            {"$set": {"status": "failed"}},
+        )
+        consolation = round(total * 0.05)
+        users().update_one({"_id": user["_id"]}, {"$inc": {"balance": int(consolation)}})
+        update_max_balance(user["_id"])
+        result = {"success": False, "reward": None, "consolation": consolation}
+
+    user = users().find_one({"_id": user["_id"]})
+    result["user"] = user_payload(user)
+    return result
 
 
 @app.get("/api/giveaways")
 def giveaways() -> dict:
     config = get_config()
     now = int(time.time())
-    giveaways = build_giveaways(config, now)
-    return {"giveaways": giveaways}
+    giveaways_list = build_giveaways(config, now)
+    return {"giveaways": giveaways_list}
 
 
 @app.post("/api/giveaways/join")
@@ -333,29 +350,30 @@ def giveaways_join(payload: GiveawayJoinRequest, authorization: Optional[str] = 
     if not giveaway:
         raise HTTPException(status_code=404, detail="Розыгрыш не найден")
 
-    with db.connect() as conn:
-        user = fetch_user(conn, token)
-        if user["balance"] < giveaway["entry"]:
-            raise HTTPException(status_code=400, detail="Недостаточно средств")
+    user = fetch_user(token)
+    if int(user.get("balance", 0)) < int(giveaway["entry"]):
+        raise HTTPException(status_code=400, detail="Недостаточно средств")
 
-        existing = conn.execute(
-            "SELECT 1 FROM giveaway_entries WHERE user_id = ? AND giveaway_id = ?",
-            (user["id"], payload.giveaway_id),
-        ).fetchone()
-        if existing:
-            return {"joined": True, "user": user_payload(conn, user)}
+    existing = giveaway_entries().find_one({"user_id": user["_id"], "giveaway_id": payload.giveaway_id})
+    if existing:
+        return {"joined": True, "user": user_payload(user)}
 
-        conn.execute(
-            "INSERT OR IGNORE INTO giveaway_entries (user_id, giveaway_id, entry, joined_at) VALUES (?, ?, ?, ?)",
-            (user["id"], payload.giveaway_id, giveaway["entry"], int(time.time())),
+    try:
+        giveaway_entries().insert_one(
+            {
+                "user_id": user["_id"],
+                "giveaway_id": payload.giveaway_id,
+                "entry": int(giveaway["entry"]),
+                "joined_at": int(time.time()),
+            }
         )
-        conn.execute(
-            "UPDATE users SET balance = balance - ? WHERE id = ?",
-            (giveaway["entry"], user["id"]),
-        )
-        conn.commit()
-        user = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
-        return {"joined": True, "user": user_payload(conn, user)}
+    except DuplicateKeyError:
+        # Race condition: already inserted
+        return {"joined": True, "user": user_payload(user)}
+
+    users().update_one({"_id": user["_id"]}, {"$inc": {"balance": -int(giveaway["entry"])}, "$set": {"updated_at": int(time.time())}})
+    user = users().find_one({"_id": user["_id"]})
+    return {"joined": True, "user": user_payload(user)}
 
 
 @app.get("/api/notifications")
@@ -366,31 +384,28 @@ def notifications(authorization: Optional[str] = Header(default=None)) -> dict:
 
     config = get_config()
     now = int(time.time())
-    with db.connect() as conn:
-        user = fetch_user(conn, token)
-        rows = conn.execute(
-            "SELECT giveaway_id, entry, joined_at FROM giveaway_entries WHERE user_id = ? ORDER BY joined_at DESC",
-            (user["id"],),
-        ).fetchall()
 
-    notifications = []
+    user = fetch_user(token)
+    rows = list(giveaway_entries().find({"user_id": user["_id"]}).sort("joined_at", -1))
+
+    notifications_list = []
     for row in rows:
         try:
             start = int(row["giveaway_id"])
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, KeyError):
             continue
         reward = giveaway_reward_for_start(config, start)
         status = "upcoming" if start > now else "finished"
-        notifications.append(
+        notifications_list.append(
             {
                 "id": row["giveaway_id"],
                 "start": start,
-                "entry": row["entry"],
+                "entry": int(row["entry"]),
                 "status": status,
                 "reward": reward,
             }
         )
-    return {"notifications": notifications}
+    return {"notifications": notifications_list}
 
 
 @app.get("/api/feed")
@@ -401,28 +416,44 @@ def feed() -> dict:
 
 @app.get("/api/top")
 def top_players() -> dict:
-    with db.connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT u.id, u.nickname, u.balance,
-                   COALESCE(SUM(CASE WHEN i.status = 'owned' THEN i.price ELSE 0 END), 0) AS inventory
-            FROM users u
-            LEFT JOIN items i ON u.id = i.user_id
-            GROUP BY u.id
-            ORDER BY u.balance + inventory DESC
-            LIMIT 10
-            """
-        ).fetchall()
-        players = [
-            {"nickname": row["nickname"], "total": int(row["balance"] + row["inventory"])}
-            for row in rows
-        ]
+    pipeline = [
+        {
+            "$lookup": {
+                "from": "items",
+                "let": {"uid": "$_id"},
+                "pipeline": [
+                    {
+                        "$match": {
+                            "$expr": {
+                                "$and": [
+                                    {"$eq": ["$user_id", "$$uid"]},
+                                    {"$eq": ["$status", "owned"]},
+                                ]
+                            }
+                        }
+                    },
+                    {"$group": {"_id": None, "sum": {"$sum": "$price"}}},
+                ],
+                "as": "inv",
+            }
+        },
+        {"$addFields": {"inventory": {"$ifNull": [{"$arrayElemAt": ["$inv.sum", 0]}, 0]}}},
+        {"$addFields": {"total": {"$add": ["$balance", "$inventory"]}}},
+        {"$sort": {"total": -1}},
+        {"$limit": 10},
+        {"$project": {"_id": 0, "nickname": 1, "total": 1}},
+    ]
+
+    players = list(users().aggregate(pipeline))
+    # Ensure ints for JSON
+    players = [{"nickname": p["nickname"], "total": int(p.get("total", 0))} for p in players]
     return {"players": players}
 
 
 @app.get("/")
 def root() -> FileResponse:
     return FileResponse(BASE_DIR / "index.html")
+
 
 @app.get("/styles.css")
 def styles() -> FileResponse:
@@ -457,46 +488,43 @@ def extract_token(authorization: Optional[str]) -> Optional[str]:
     return authorization.strip()
 
 
-def fetch_user(conn, token: str):
-    user = conn.execute("SELECT * FROM users WHERE token = ?", (token,)).fetchone()
+def fetch_user(token: str) -> dict:
+    user = users().find_one({"token": token})
     if not user:
         raise HTTPException(status_code=401, detail="Неверный токен")
     return user
 
 
-def user_payload(conn, user_row) -> dict:
-    inventory_rows = conn.execute(
-        "SELECT * FROM items WHERE user_id = ? ORDER BY created_at DESC",
-        (user_row["id"],),
-    ).fetchall()
+def user_payload(user_row: dict) -> dict:
+    inventory_rows = list(items().find({"user_id": user_row["_id"]}).sort("created_at", -1))
 
     inventory = [
         {
-            "id": item["id"],
+            "id": item["_id"],
             "name": item["name"],
             "rarity": item["rarity"],
-            "price": item["price"],
-            "stattrak": bool(item["stattrak"]),
+            "price": int(item["price"]),
+            "stattrak": bool(item.get("stattrak", False)),
             "status": item["status"],
             "source": item["source"],
         }
         for item in inventory_rows
     ]
 
-    best_drop = fetch_item(conn, user_row["best_drop_item_id"])
-    best_upgrade = fetch_item(conn, user_row["best_upgrade_item_id"])
+    best_drop = fetch_item(user_row.get("best_drop_item_id"))
+    best_upgrade = fetch_item(user_row.get("best_upgrade_item_id"))
 
     return {
         "nickname": user_row["nickname"],
-        "balance": user_row["balance"],
-        "last_claim": user_row["last_claim"],
+        "balance": int(user_row.get("balance", 0)),
+        "last_claim": int(user_row.get("last_claim", 0)),
         "stats": {
-            "cases_opened": user_row["cases_opened"],
-            "cases_won": user_row["cases_won"],
-            "upgrades": user_row["upgrades"],
-            "upgrade_wins": user_row["upgrade_wins"],
-            "max_balance": user_row["max_balance"],
-            "daily_cases": user_row["daily_cases"],
+            "cases_opened": int(user_row.get("cases_opened", 0)),
+            "cases_won": int(user_row.get("cases_won", 0)),
+            "upgrades": int(user_row.get("upgrades", 0)),
+            "upgrade_wins": int(user_row.get("upgrade_wins", 0)),
+            "max_balance": int(user_row.get("max_balance", 0)),
+            "daily_cases": int(user_row.get("daily_cases", 0)),
             "best_drop": best_drop,
             "best_upgrade": best_upgrade,
         },
@@ -504,82 +532,79 @@ def user_payload(conn, user_row) -> dict:
     }
 
 
-def fetch_item(conn, item_id: Optional[str]) -> Optional[dict]:
+def fetch_item(item_id: Optional[str]) -> Optional[dict]:
     if not item_id:
         return None
-    item = conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
+    item = items().find_one({"_id": item_id})
     if not item:
         return None
     return {
-        "id": item["id"],
+        "id": item["_id"],
         "name": item["name"],
         "rarity": item["rarity"],
-        "price": item["price"],
-        "stattrak": bool(item["stattrak"]),
+        "price": int(item["price"]),
+        "stattrak": bool(item.get("stattrak", False)),
     }
 
 
-def fetch_items(conn, user_id: int, item_ids: list[str]):
+def fetch_items(user_id, item_ids: list[str]):
     if not item_ids:
         return []
-    query = "SELECT * FROM items WHERE user_id = ? AND status = 'owned' AND id IN ({seq})".format(
-        seq=",".join("?" * len(item_ids))
-    )
-    return conn.execute(query, [user_id, *item_ids]).fetchall()
+    return list(items().find({"user_id": user_id, "status": "owned", "_id": {"$in": item_ids}}))
 
 
-def reset_daily(conn, user_row):
+def reset_daily(user_row: dict):
     today = today_key()
-    if user_row["daily_reset"] != today:
-        conn.execute(
-            "UPDATE users SET daily_cases = 0, daily_reset = ? WHERE id = ?",
-            (today, user_row["id"]),
+    if int(user_row.get("daily_reset", 0)) != today:
+        users().update_one(
+            {"_id": user_row["_id"]},
+            {"$set": {"daily_cases": 0, "daily_reset": today, "updated_at": int(time.time())}},
         )
-        conn.commit()
-        return conn.execute("SELECT * FROM users WHERE id = ?", (user_row["id"],)).fetchone()
+        return users().find_one({"_id": user_row["_id"]})
     return user_row
 
 
-def update_max_balance(conn, user_id: int) -> None:
-    conn.execute(
-        "UPDATE users SET max_balance = CASE WHEN balance > max_balance THEN balance ELSE max_balance END WHERE id = ?",
-        (user_id,),
+def update_max_balance(user_id) -> None:
+    users().update_one(
+        {"_id": user_id},
+        [{"$set": {"max_balance": {"$max": ["$balance", {"$ifNull": ["$max_balance", 0]}]}}}],
     )
 
 
-def maybe_update_best(conn, user_row, item_id: str, is_upgrade: bool) -> None:
-    item = conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
+def maybe_update_best(user_row: dict, item_id: str, is_upgrade: bool) -> None:
+    item = items().find_one({"_id": item_id})
     if not item:
         return
 
     field = "best_upgrade_item_id" if is_upgrade else "best_drop_item_id"
-    current_id = user_row[field]
+    current_id = user_row.get(field)
     if current_id:
-        current = conn.execute("SELECT price FROM items WHERE id = ?", (current_id,)).fetchone()
-        if current and current["price"] >= item["price"]:
+        current = items().find_one({"_id": current_id}, {"price": 1})
+        if current and int(current.get("price", 0)) >= int(item.get("price", 0)):
             return
 
-    conn.execute(f"UPDATE users SET {field} = ? WHERE id = ?", (item_id, user_row["id"]))
+    users().update_one({"_id": user_row["_id"]}, {"$set": {field: item_id}})
 
 
-def create_item(conn, user_id: int, drop: dict, status: str, source: str, case_id: Optional[str]) -> str:
+def create_item(user_id, drop: dict, status: str, source: str, case_id: Optional[str]) -> str:
     item_id = uuid.uuid4().hex
     drop["id"] = item_id
-    conn.execute(
-        "INSERT INTO items (id, user_id, name, rarity, price, stattrak, status, source, case_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            item_id,
-            user_id,
-            drop["name"],
-            drop["rarity"],
-            drop["price"],
-            int(drop.get("stattrak", False)),
-            status,
-            source,
-            case_id,
-            int(time.time()),
-        ),
+
+    items().insert_one(
+        {
+            "_id": item_id,
+            "user_id": user_id,
+            "name": drop["name"],
+            "rarity": drop["rarity"],
+            "price": int(drop["price"]),
+            "stattrak": bool(drop.get("stattrak", False)),
+            "status": status,
+            "source": source,
+            "case_id": case_id,
+            "created_at": int(time.time()),
+        }
     )
+
     return item_id
 
 
@@ -696,11 +721,11 @@ def build_giveaways(config: Config, now: int) -> list[dict]:
     interval = 5 * 60 * 60
     next_start = ((now // interval) + 1) * interval
     entries = [199, 349, 549]
-    giveaways = []
+    giveaways_list = []
     for idx in range(3):
         start = next_start + idx * interval
         reward = giveaway_reward_for_start(config, start)
-        giveaways.append(
+        giveaways_list.append(
             {
                 "id": str(start),
                 "entry": entries[min(idx, len(entries) - 1)],
@@ -708,7 +733,7 @@ def build_giveaways(config: Config, now: int) -> list[dict]:
                 "reward": reward,
             }
         )
-    return giveaways
+    return giveaways_list
 
 
 def giveaway_reward_for_start(config: Config, start: int) -> dict:
