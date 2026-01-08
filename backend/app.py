@@ -19,7 +19,6 @@ from pymongo.errors import DuplicateKeyError
 from . import db
 from .config import Config, RARITIES, get_config
 
-BASE_DIR = db.BASE_DIR
 
 app = FastAPI(title="Kazino API")
 
@@ -464,15 +463,6 @@ def styles() -> FileResponse:
 def script() -> FileResponse:
     return FileResponse(BASE_DIR / "app.js")
 
-@app.get("/api/debug/db")
-def debug_db():
-    try:
-        client = get_client()
-        client.admin.command("ping")
-        return {"mongo": "connected"}
-    except Exception as e:
-        return {"mongo": "error", "message": str(e)}
-}
 
 
 GUNS_DIR = BASE_DIR / "guns"
