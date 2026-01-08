@@ -1,45 +1,62 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import Optional
 
 from pymongo import MongoClient
 
-BASE_DIR = Path(__file__).resolve().parents[1]
-
-# Env vars:
-# - MONGODB_URI (required)
-# - MONGODB_DB (optional, default: kazino)
-_MONGODB_URI = os.environ.get("MONGODB_URI") or os.environ.get("KAZINO_MONGODB_URI")
-_MONGODB_DB = os.environ.get("MONGODB_DB") or os.environ.get("KAZINO_MONGODB_DB") or "kazino"
-
 _client: Optional[MongoClient] = None
 
 
-def get_client() -> MongoClient:
-    """Return a cached MongoClient.
+def _get_env_uri() -> str | None:
+    # Приоритет: что создала Vercel-интеграция
+    return (
+        os.environ.get("STORAGE_MONGODB_URI")
+        or os.environ.get("MONGODB_URI")
+        or os.environ.get("KAZINO_MONGODB_URI")
+        or os.environ.get("KAZINO_MONGODB_URI".lower())  # на всякий
+    )
 
-    In serverless (Vercel) this dramatically reduces connection churn on warm invocations.
+
+def _get_env_dbname() -> str:
+    # Приоритет: что создала Vercel-интеграция
+    return (
+        os.environ.get("STORAGE_MONGODB_DB")
+        or os.environ.get("MONGODB_DB")
+        or os.environ.get("KAZINO_MONGODB_DB")
+        or "kazino"
+    )
+
+
+def get_client() -> MongoClient:
+    """Return cached MongoClient.
+
+    В serverless это снижает churn подключений на warm-invocations.
     """
 
     global _client
     if _client is None:
-        if not _MONGODB_URI:
+        uri = _get_env_uri()
+        if not uri:
             raise RuntimeError(
-                "MONGODB_URI is not set. Add it in your environment variables (Vercel Project Settings)."
+                "MongoDB URI not set. Set STORAGE_MONGODB_URI (Vercel integration) "
+                "or MONGODB_URI in Vercel Environment Variables."
             )
+
+        # Важно: MongoClient сам по себе ленивый — реальное подключение при первом запросе.
         _client = MongoClient(
-            _MONGODB_URI,
-            serverSelectionTimeoutMS=5000,
-            connectTimeoutMS=5000,
-            socketTimeoutMS=10000,
+            uri,
+            # таймауты чтобы не висело вечно, но и не было слишком агрессивно
+            serverSelectionTimeoutMS=8000,
+            connectTimeoutMS=8000,
+            socketTimeoutMS=15000,
         )
+
     return _client
 
 
 def get_db():
-    return get_client()[_MONGODB_DB]
+    return get_client()[_get_env_dbname()]
 
 
 def users_col():
